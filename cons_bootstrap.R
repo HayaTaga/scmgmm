@@ -1,9 +1,9 @@
-# SCM-GMM with Constrained Multiplier Bootstrap (CNS 2023 full version only)
-# Author: ChatGPT
-# Depends: stats, sandwich, quadprog, purrr (optional), parallel (optional)
+# =========================================================
+# SCM-GMM (CNS) + AE(2023)-style Rn calibration & test inversion
+# =========================================================
+# Depends: stats, sandwich, quadprog, (optional) parallel, (optional) lpSolve
 
 # ---- Libraries ----
-# Explicit imports (safe if script-sourced)
 if (!requireNamespace("sandwich", quietly = TRUE)) {
   stop("Package 'sandwich' required.")
 }
@@ -12,14 +12,46 @@ if (!requireNamespace("quadprog", quietly = TRUE)) {
 }
 
 # -----------------------------
-# Data structure expected
+# Utilities (AE-style)
 # -----------------------------
-# data <- list(
-#   Y0 = numeric T vector for treated unit,
-#   Ydonor = T x J matrix for donor units (columns are donors),
-#   X = T x K matrix of instruments (may include constant),
-#   T0 = integer, last pre-treatment index (1..T-1)
-# )
+sqrtm_sym <- function(M) {
+  M <- as.matrix(M)
+  E <- eigen((M + t(M)) / 2, symmetric = TRUE)
+  vals <- pmax(E$values, 0)
+  E$vectors %*% diag(sqrt(vals), nrow = length(vals)) %*% t(E$vectors)
+}
+
+# Rn calibration for moments (identity constraints on moments)
+# We approximate AE's sup-stat calibration on studentized inequalities
+# by using the moments' HAC covariance Omega and simulating max |U_i|
+# where U ~ N(0, Omega). Return quantile pRn of sup-norm.
+select_Rn_moments <- function(Omega, B = 500, pRn = 0.95, seed = 210) {
+  set.seed(seed)
+  m <- ncol(Omega)
+  Sroot <- sqrtm_sym(Omega)
+  draws <- replicate(B, {
+    z <- rnorm(m)
+    u <- Sroot %*% z
+    max(abs(u)) # sup-norm (two-sided). If one-sided is desired, use max(u)
+  })
+  max(stats::quantile(draws, pRn, na.rm = TRUE), 0)
+}
+
+# -----------------------------
+# Data structure helper
+# -----------------------------
+make_scm_data <- function(Y0, Ydonor, T0, X = NULL) {
+  stopifnot(length(Y0) == nrow(Ydonor))
+  if (is.null(X)) {
+    X <- matrix(1, nrow = length(Y0), ncol = 1)
+  }
+  list(
+    Y0 = as.numeric(Y0),
+    Ydonor = as.matrix(Ydonor),
+    X = as.matrix(X),
+    T0 = as.integer(T0)
+  )
+}
 
 # -----------------------------
 # 1) Moment functions
@@ -38,12 +70,10 @@ calculate_moments <- function(theta, data) {
   w <- theta[seq_len(J)]
   tau <- theta[J + 1]
   synth <- as.numeric(Yd %*% w)
-  pre_mask <- seq_len(T) <= T0
-  post_mask <- seq_len(T) > T0
-  g_pre <- X[pre_mask, , drop = FALSE] *
-    as.numeric(Y0[pre_mask] - synth[pre_mask])
-  g_post <- X[post_mask, , drop = FALSE] *
-    as.numeric((Y0[post_mask] - synth[post_mask]) - tau)
+  pre <- seq_len(T) <= T0
+  post <- !pre
+  g_pre <- X[pre, , drop = FALSE] * as.numeric(Y0[pre] - synth[pre])
+  g_post <- X[post, , drop = FALSE] * as.numeric((Y0[post] - synth[post]) - tau)
   g <- rbind(g_pre, g_post)
   colMeans(g)
 }
@@ -62,14 +92,11 @@ calculate_moment_contributions <- function(theta, data) {
   w <- theta[seq_len(J)]
   tau <- theta[J + 1]
   synth <- as.numeric(Yd %*% w)
-  pre_mask <- seq_len(T) <= T0
-  post_mask <- seq_len(T) > T0
-  g_pre <- X[pre_mask, , drop = FALSE] *
-    as.numeric(Y0[pre_mask] - synth[pre_mask])
-  g_post <- X[post_mask, , drop = FALSE] *
-    as.numeric((Y0[post_mask] - synth[post_mask]) - tau)
-  g <- rbind(g_pre, g_post)
-  g
+  pre <- seq_len(T) <= T0
+  post <- !pre
+  g_pre <- X[pre, , drop = FALSE] * as.numeric(Y0[pre] - synth[pre])
+  g_post <- X[post, , drop = FALSE] * as.numeric((Y0[post] - synth[post]) - tau)
+  rbind(g_pre, g_post) # T × K
 }
 
 calculate_hac_matrix <- function(
@@ -79,18 +106,12 @@ calculate_hac_matrix <- function(
   bw = NULL,
   prewhite = FALSE
 ) {
-  # HAC estimator for moment contributions (matrix input)
-  # - kernel: "Bartlett" (Newey-West) or "QS" (Quadratic Spectral)
-  # - L: lag truncation for Bartlett (if NULL, uses Andrews-style plug-in)
-  # - bw: bandwidth for QS (if NULL, uses b = 1.3221 * T^(1/5))
-  # - prewhite: VAR(1) prewhitening with recoloring (Andrews–Monahan)
   Z <- as.matrix(g_t_matrix)
   Z <- scale(Z, center = TRUE, scale = FALSE)
   T <- nrow(Z)
   m <- ncol(Z)
   kern <- match.arg(kernel)
 
-  # Optional VAR(1) prewhitening
   if (prewhite && T >= 3) {
     Zlag <- Z[1:(T - 1), , drop = FALSE]
     Zlead <- Z[2:T, , drop = FALSE]
@@ -109,8 +130,7 @@ calculate_hac_matrix <- function(
     )
     IA <- diag(m) - A
     IA_t <- diag(m) - t(A)
-    Omega <- solve(IA_t, Omega_e) %*% solve(IA)
-    return(Omega)
+    return(solve(IA_t, Omega_e) %*% solve(IA))
   }
 
   if (kern == "Bartlett") {
@@ -137,10 +157,10 @@ calculate_hac_matrix <- function(
     Omega <- Gamma0
     for (k in 1:(T - 1)) {
       x <- k / bw
-      if (x == 0) {
-        w <- 1
+      w <- if (x == 0) {
+        1
       } else {
-        w <- 25 /
+        25 /
           (12 * pi^2 * x^2) *
           (sin(6 * pi * x) / (6 * pi * x) - cos(6 * pi * x))
       }
@@ -156,18 +176,9 @@ calculate_hac_matrix <- function(
   }
 }
 
-.simplex_from_free <- function(u) {
-  u_pos <- pmax(u, 0)
-  last <- pmax(1 - sum(u_pos), 0)
-  w <- c(u_pos, last)
-  if (sum(w) == 0) {
-    w[length(w)] <- 1
-  } else {
-    w <- w / sum(w)
-  }
-  w
-}
-
+# -----------------------------
+# 2) Test statistic (outer problem) with QP for w (sum=1, w>=0)
+# -----------------------------
 compute_test_stat <- function(lambda, data, W_matrix) {
   Y0 <- as.numeric(data$Y0)
   Yd <- as.matrix(data$Ydonor)
@@ -181,7 +192,7 @@ compute_test_stat <- function(lambda, data, W_matrix) {
   K <- ncol(X)
   T0 <- data$T0
 
-  # m 次元（= K）に合わせて W を検査・調整
+  # Moment covariance -> W check
   tmp_theta <- c(rep(1 / J, J), lambda)
   m_dim <- ncol(calculate_moment_contributions(tmp_theta, data))
   if (!is.matrix(W_matrix) || any(dim(W_matrix) != c(m_dim, m_dim))) {
@@ -195,30 +206,23 @@ compute_test_stat <- function(lambda, data, W_matrix) {
       t(eig$vectors)
   }
 
-  # ḡ(w) = c - B w を構成
+  # Build c and B: ḡ(w) = c - B w  (K×1, K×J)
   pre <- seq_len(T) <= T0
   post <- !pre
-  # c = 平均_t [ X_t * (Y0_t - 1{post}*lambda) ]  （K×1）
   c_vec <- colMeans(rbind(
     X[pre, , drop = FALSE] * Y0[pre],
     X[post, , drop = FALSE] * (Y0[post] - lambda)
   ))
-
-  # B の各列 j は 平均_t [ X_t * Yd_{t,j} ]  （K×J）
   Bmat <- sapply(seq_len(J), function(j) colMeans(X * Yd[, j]))
   if (is.null(dim(Bmat))) {
     Bmat <- matrix(Bmat, nrow = K, ncol = J)
   }
 
-  # 目的関数：min_w (c - B w)' W (c - B w)
-  # solve.QP 形式：min_w 1/2 w' D w - d' w
   D <- 2 * t(Bmat) %*% W_matrix %*% Bmat
   d <- 2 * t(Bmat) %*% W_matrix %*% c_vec
-  D <- (D + t(D)) / 2 + diag(1e-8, J) # 数値安定化の微小リッジ
+  D <- (D + t(D)) / 2 + diag(1e-8, J)
 
-  # 制約：sum(w)=1（等式）, w>=0（不等式）
-  # quadprog は列が各制約、先頭 meq 列が等式
-  Amat <- cbind(rep(1, J), diag(J))
+  Amat <- cbind(rep(1, J), diag(J)) # eq first col, then inequalities
   bvec <- c(1, rep(0, J))
   meq <- 1L
 
@@ -226,19 +230,15 @@ compute_test_stat <- function(lambda, data, W_matrix) {
     quadprog::solve.QP(Dmat = D, dvec = d, Amat = Amat, bvec = bvec, meq = meq),
     error = function(e) NULL
   )
-  if (is.null(sol)) {
-    # フォールバック：等分重み
-    w_hat <- rep(1 / J, J)
+  w_hat <- if (is.null(sol)) {
+    rep(1 / J, J)
   } else {
-    w_hat <- pmax(sol$solution, 0)
-    sw <- sum(w_hat)
-    if (sw <= 0) w_hat[] <- 1 / J else w_hat <- w_hat / sw
+    ww <- pmax(sol$solution, 0)
+    sw <- sum(ww)
+    if (sw <= 0) rep(1 / J, J) else ww / sw
   }
-
-  # 検定統計量
   gbar <- c_vec - Bmat %*% w_hat
   I_n <- as.numeric(t(gbar) %*% W_matrix %*% gbar)
-
   list(
     I_n = I_n,
     w_hat = as.numeric(w_hat),
@@ -249,60 +249,52 @@ compute_test_stat <- function(lambda, data, W_matrix) {
 }
 
 # -----------------------------
-# 2) Full constrained bootstrap per CNS (2023)
+# 3) Inner bootstrap QP (CNS)
 # -----------------------------
-
 .jacobian_moments <- function(theta, data) {
-  Y0 <- as.numeric(data$Y0)
   Yd <- as.matrix(data$Ydonor)
-  T <- NROW(Yd)
-  J <- NCOL(Yd)
+  T <- nrow(Yd)
+  J <- ncol(Yd)
   X <- if (!is.null(data$X)) {
     as.matrix(data$X)
   } else {
     matrix(1, nrow = T, ncol = 1)
   }
-  K <- NCOL(X)
+  K <- ncol(X)
   T0 <- data$T0
 
   Dw <- sapply(seq_len(J), function(j) colMeans(X * as.numeric(-Yd[, j])))
   if (is.null(dim(Dw))) {
-    Dw <- matrix(Dw, nrow = K, ncol = J, byrow = FALSE)
+    Dw <- matrix(Dw, nrow = K, ncol = J)
   } else {
     Dw <- matrix(Dw, nrow = K, ncol = J)
   }
-
   Dtau <- colMeans(rbind(
     matrix(0, nrow = T0, ncol = K),
     -X[(T0 + 1):T, , drop = FALSE]
   ))
   Dtau <- matrix(as.numeric(Dtau), nrow = K, ncol = 1)
-
-  # Jmat: K × (J+1)
   Jmat <- cbind(Dw, Dtau)
   dim(Jmat) <- c(K, J + 1)
-  return(Jmat)
+  Jmat
 }
 
 .build_local_constraints <- function(w_hat, T, r_n) {
+  # AE風: r_n を校正。閾値は r_n / sqrt(T)
   J <- length(w_hat)
   thr <- r_n / sqrt(T)
-
   Aeq <- matrix(0, nrow = 1, ncol = J + 1)
   Aeq[1, 1:J] <- 1
   beq <- 0
-
-  active_idx <- which(!is.na(w_hat) & w_hat <= thr)
-  if (length(active_idx) == 0L) {
+  active <- which(!is.na(w_hat) & w_hat <= thr)
+  if (length(active) == 0L) {
     return(list(Aeq = Aeq, beq = beq, Aineq = NULL, bineq = NULL))
   }
-
-  Aineq <- matrix(0, nrow = length(active_idx), ncol = J + 1)
-  for (k in seq_along(active_idx)) {
-    Aineq[k, active_idx[k]] <- 1
+  Aineq <- matrix(0, nrow = length(active), ncol = J + 1)
+  for (k in seq_along(active)) {
+    Aineq[k, active[k]] <- 1
   }
-  bineq <- -sqrt(T) * w_hat[active_idx]
-
+  bineq <- -sqrt(T) * w_hat[active] # local h_j >= -sqrt(T) * w_hat_j  (CNSのローカル近似)
   list(Aeq = Aeq, beq = beq, Aineq = Aineq, bineq = bineq)
 }
 
@@ -316,16 +308,10 @@ compute_test_stat <- function(lambda, data, W_matrix) {
   bineq = NULL,
   ridge = 1e-8
 ) {
-  if (!is.matrix(Jmat)) {
-    Jmat <- as.matrix(Jmat)
-  }
-  if (!is.matrix(W)) {
-    W <- as.matrix(W)
-  }
+  Jmat <- as.matrix(Jmat)
+  W <- as.matrix(W)
   m <- nrow(Jmat)
   p <- ncol(Jmat)
-
-  # 1) W のブロードキャスト & 形の統一
   if (nrow(W) == 1L && ncol(W) == 1L) {
     W <- as.numeric(W[1, 1]) * diag(m)
   }
@@ -338,15 +324,9 @@ compute_test_stat <- function(lambda, data, W_matrix) {
       m
     ))
   }
-
-  # 2) Gstar を m×1 の列ベクトルへ強制
   Gstar <- matrix(as.numeric(Gstar), nrow = m, ncol = 1)
-
-  # 3) QP の各成分（crossprodは行列次元が明確になるよう t( ) を使用）
   H <- 2 * t(Jmat) %*% W %*% Jmat + diag(ridge, p)
   f <- as.numeric(2 * t(Jmat) %*% W %*% Gstar)
-
-  # 4) 制約
   Amat <- t(Aeq)
   bvec <- beq
   meq <- nrow(Aeq)
@@ -354,7 +334,6 @@ compute_test_stat <- function(lambda, data, W_matrix) {
     Amat <- cbind(Amat, t(Aineq))
     bvec <- c(bvec, bineq)
   }
-
   sol <- tryCatch(
     quadprog::solve.QP(Dmat = H, dvec = f, Amat = Amat, bvec = bvec, meq = meq),
     error = function(e) NULL
@@ -362,9 +341,8 @@ compute_test_stat <- function(lambda, data, W_matrix) {
   if (is.null(sol)) {
     return(list(value = NA_real_, par = rep(NA_real_, p)))
   }
-
   h <- sol$solution
-  resid <- Gstar - Jmat %*% h # m×1
+  resid <- Gstar - Jmat %*% h
   val <- as.numeric(t(resid) %*% W %*% resid)
   list(value = val, par = h)
 }
@@ -375,22 +353,20 @@ compute_test_stat <- function(lambda, data, W_matrix) {
   W_matrix,
   w_hat,
   B = 999,
-  rn = NULL,
+  r_n = NULL,
   seed = NULL
 ) {
   if (!is.null(seed)) {
     set.seed(seed)
   }
-
   theta_hat <- c(w_hat, lambda)
-  G <- calculate_moment_contributions(theta_hat, data) # T × m
+  G <- calculate_moment_contributions(theta_hat, data)
   Gc <- scale(G, center = TRUE, scale = FALSE)
   T <- nrow(Gc)
-
   Jmat <- .jacobian_moments(theta_hat, data) # m × p
   m <- nrow(Jmat)
 
-  # --- 重要ポイント：W を m×m に合わせて再構築 ---
+  # W refresh to m×m if needed
   if (!is.matrix(W_matrix) || any(dim(W_matrix) != c(m, m))) {
     Omega <- calculate_hac_matrix(G, kernel = "QS", prewhite = TRUE)
     eig <- eigen(Omega, symmetric = TRUE)
@@ -400,17 +376,16 @@ compute_test_stat <- function(lambda, data, W_matrix) {
       diag(1 / eig$values, nrow = length(eig$values)) %*%
       t(eig$vectors)
   }
-  # ---------------------------------------------------
 
-  if (is.null(rn)) {
-    rn <- max(1, sqrt(log(max(T, 10))))
-  }
-  cons <- .build_local_constraints(w_hat, T, rn)
+  if (is.null(r_n)) {
+    r_n <- max(1, sqrt(log(max(T, 10))))
+  } # fallback if Rn not supplied
+  cons <- .build_local_constraints(w_hat, T, r_n)
 
   boot_stats <- numeric(B)
   for (b in seq_len(B)) {
     v <- rnorm(T)
-    G_star <- as.numeric(colSums(Gc * v) / sqrt(T)) # m 次元
+    G_star <- as.numeric(colSums(Gc * v) / sqrt(T))
     qp <- .solve_qp_boot(
       Jmat,
       W_matrix,
@@ -425,12 +400,35 @@ compute_test_stat <- function(lambda, data, W_matrix) {
   boot_stats
 }
 
+# -----------------------------
+# 4) Critical value via bootstrap & TestPoint (p-value)
+# -----------------------------
+.compute_Rn_from_data <- function(
+  data,
+  w_for_Rn = NULL,
+  B = 500,
+  pRn = 0.95,
+  seed = 210
+) {
+  # Rn calibrates on moments' covariance Omega
+  Yd <- as.matrix(data$Ydonor)
+  T <- nrow(Yd)
+  J <- ncol(Yd)
+  if (is.null(w_for_Rn)) {
+    w_for_Rn <- rep(1 / J, J)
+  }
+  theta <- c(w_for_Rn, 0)
+  G <- calculate_moment_contributions(theta, data)
+  Omega <- calculate_hac_matrix(G, kernel = "QS", prewhite = TRUE)
+  select_Rn_moments(Omega, B = B, pRn = pRn, seed = seed)
+}
+
 compute_critical_value <- function(
   lambda_info,
   data,
   W_matrix,
   B = 999,
-  rn = NULL,
+  r_n = NULL,
   seed = NULL,
   alpha = 0.05
 ) {
@@ -440,7 +438,7 @@ compute_critical_value <- function(
     W_matrix = W_matrix,
     w_hat = lambda_info$w_hat,
     B = B,
-    rn = rn,
+    r_n = r_n,
     seed = seed
   )
   list(
@@ -454,18 +452,17 @@ test_point_scm <- function(
   data,
   W_matrix,
   B = 999,
-  rn = NULL,
+  r_n = NULL,
   seed = NULL,
   alpha = 0.05
 ) {
   info <- compute_test_stat(lambda, data, W_matrix)
-  # pass through possibly recomputed W to bootstrap
   crit <- compute_critical_value(
     info,
     data,
     info$W_matrix,
     B = B,
-    rn = rn,
+    r_n = r_n,
     seed = seed,
     alpha = alpha
   )
@@ -480,6 +477,139 @@ test_point_scm <- function(
   )
 }
 
+# -----------------------------
+# 5) AE-style: grid + inversion with uniroot (find CI)
+#     - pRn から Rn を校正して r_n に投入
+# -----------------------------
+find_ci_scm <- function(
+  data,
+  tau_grid,
+  B = 999,
+  W_matrix = NULL,
+  r_n = NULL,
+  pRn = 0.95,
+  B_Rn = 500,
+  seed = NULL,
+  alpha = 0.05,
+  parallel = FALSE,
+  refine = TRUE,
+  tol = 1e-3
+) {
+  if (is.null(W_matrix)) {
+    W_matrix <- .find_W_matrix(data)
+  }
+  # AE-style Rn calibration (if r_n not supplied)
+  if (is.null(r_n)) {
+    Rn <- .compute_Rn_from_data(
+      data,
+      w_for_Rn = NULL,
+      B = B_Rn,
+      pRn = pRn,
+      seed = if (is.null(seed)) 210 else seed
+    )
+    r_n <- max(1e-8, Rn) # feed into local constraints threshold
+  }
+
+  runner <- function(tau) {
+    test_point_scm(
+      tau,
+      data,
+      W_matrix,
+      B = B,
+      r_n = r_n,
+      seed = seed,
+      alpha = alpha
+    )$p_value
+  }
+  if (parallel && requireNamespace("parallel", quietly = TRUE)) {
+    p_values <- parallel::mclapply(
+      tau_grid,
+      runner,
+      mc.cores = max(1L, parallel::detectCores() - 1L)
+    )
+    p_values <- unlist(p_values)
+  } else {
+    p_values <- vapply(tau_grid, runner, numeric(1))
+  }
+  accepted <- tau_grid[p_values > alpha]
+  ci_grid <- if (length(accepted)) range(accepted) else c(NA_real_, NA_real_)
+  if (!refine || any(is.na(ci_grid))) {
+    return(list(
+      ci = ci_grid,
+      grid = tau_grid,
+      p_values = p_values,
+      alpha = alpha,
+      r_n = r_n
+    ))
+  }
+
+  # --- AEの fzero に相当：端点付近を uniroot で精密化 ---
+  f_p <- function(x) runner(x) - (1 - (1 - alpha)) # = p(x) - alpha
+  # 下端
+  lower <- ci_grid[1]
+  upper <- ci_grid[2]
+  # bracket for lower endpoint
+  iL <- max(which(tau_grid <= lower))
+  iL <- max(1, iL - 1)
+  aL <- tau_grid[iL]
+  bL <- tau_grid[min(length(tau_grid), iL + 1)]
+  if (is.na(f_p(aL)) || is.na(f_p(bL))) {
+    ci_low <- lower
+  } else {
+    if (f_p(aL) * f_p(bL) > 0) {
+      # 少し外側に広げる（AEの while に相当）
+      step <- max(0.2 * (bL - aL), 1e-2)
+      repeat {
+        aL <- aL - step
+        if (aL < min(tau_grid)) {
+          break
+        }
+        if (!is.na(f_p(aL)) && f_p(aL) * f_p(bL) <= 0) break
+      }
+    }
+    rootL <- try(
+      uniroot(f_p, lower = min(aL, bL), upper = max(aL, bL), tol = tol),
+      silent = TRUE
+    )
+    ci_low <- if (inherits(rootL, "try-error")) lower else rootL$root
+  }
+  # bracket for upper endpoint
+  iU <- min(which(tau_grid >= upper))
+  iU <- min(length(tau_grid) - 1, max(1, iU))
+  aU <- tau_grid[iU]
+  bU <- tau_grid[iU + 1]
+  if (is.na(f_p(aU)) || is.na(f_p(bU))) {
+    ci_up <- upper
+  } else {
+    if (f_p(aU) * f_p(bU) > 0) {
+      step <- max(0.2 * (bU - aU), 1e-2)
+      repeat {
+        bU <- bU + step
+        if (bU > max(tau_grid)) {
+          break
+        }
+        if (!is.na(f_p(aU)) && f_p(aU) * f_p(bU) <= 0) break
+      }
+    }
+    rootU <- try(
+      uniroot(f_p, lower = min(aU, bU), upper = max(aU, bU), tol = tol),
+      silent = TRUE
+    )
+    ci_up <- if (inherits(rootU, "try-error")) upper else rootU$root
+  }
+
+  list(
+    ci = c(ci_low, ci_up),
+    grid = tau_grid,
+    p_values = p_values,
+    alpha = alpha,
+    r_n = r_n
+  )
+}
+
+# -----------------------------
+# 6) Weighting matrix from HAC (same as before)
+# -----------------------------
 .find_W_matrix <- function(data, w_init = NULL, tau_init = 0) {
   Yd <- as.matrix(data$Ydonor)
   J <- ncol(Yd)
@@ -492,65 +622,14 @@ test_point_scm <- function(
   eig <- eigen(Omega, symmetric = TRUE)
   tol <- 1e-8
   eig$values[eig$values < tol] <- tol
-  Omega_inv <- eig$vectors %*%
+  eig$vectors %*%
     diag(1 / eig$values, nrow = length(eig$values)) %*%
     t(eig$vectors)
-  Omega_inv
 }
 
-find_ci_scm <- function(
-  data,
-  tau_grid,
-  B = 999,
-  W_matrix = NULL,
-  rn = NULL,
-  seed = NULL,
-  alpha = 0.05,
-  parallel = FALSE
-) {
-  if (is.null(W_matrix)) {
-    W_matrix <- .find_W_matrix(data)
-  }
-  runner <- function(tau) {
-    test_point_scm(
-      tau,
-      data,
-      W_matrix,
-      B = B,
-      rn = rn,
-      seed = seed,
-      alpha = alpha
-    )$p_value
-  }
-  if (parallel) {
-    p_values <- parallel::mclapply(
-      tau_grid,
-      runner,
-      mc.cores = max(1L, parallel::detectCores() - 1L)
-    )
-    p_values <- unlist(p_values)
-  } else {
-    p_values <- vapply(tau_grid, runner, numeric(1))
-  }
-  accepted <- tau_grid[p_values > alpha]
-  ci <- if (length(accepted)) range(accepted) else c(NA_real_, NA_real_)
-  list(ci = ci, grid = tau_grid, p_values = p_values, alpha = alpha)
-}
-
-make_scm_data <- function(Y0, Ydonor, T0, X = NULL) {
-  stopifnot(length(Y0) == nrow(Ydonor))
-  if (is.null(X)) {
-    X <- matrix(1, nrow = length(Y0), ncol = 1)
-  }
-  list(
-    Y0 = as.numeric(Y0),
-    Ydonor = as.matrix(Ydonor),
-    X = as.matrix(X),
-    T0 = as.integer(T0)
-  )
-}
-
-# Example usage (pseudo)
+# -----------------------------
+# 7) Example (smoke test)
+# -----------------------------
 set.seed(1)
 T <- 100
 T0 <- 70
@@ -563,7 +642,7 @@ tau_true <- 1
 Y0[(T0 + 1):T] <- Y0[(T0 + 1):T] + tau_true
 data <- make_scm_data(Y0, Ydonor, T0)
 tau_grid <- seq(0, 2, by = 0.1)
-res <- find_ci_scm(data, tau_grid, B = 999)
+res <- find_ci_scm(data, tau_grid, B = 999, pRn = 0.95, B_Rn = 500, seed = 1)
 print(res$ci)
 
 source("scm_method.R")
